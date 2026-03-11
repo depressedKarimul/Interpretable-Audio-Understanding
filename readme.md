@@ -15,7 +15,6 @@ This project implements an **Explainable Environmental Sound Classification (ESC
 
 ```text
 ├── Explainable_ESC.ipynb    # Research notebook for model training, evaluation, and XAI experiments
-├── generate_notebook.py     # Script to generate the comprehensive research notebook
 ├── project/
 │   ├── app.py               # Main Streamlit application entry point
 │   ├── utils.py             # Core logic for audio processing, model inference, and XAI generators
