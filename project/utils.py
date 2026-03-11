@@ -13,9 +13,18 @@ CLASSES = ['air_conditioner', 'car_horn', 'children_playing', 'dog_bark', 'drill
            'engine_idling', 'gun_shot', 'jackhammer', 'siren', 'street_music']
 
 def load_audio_file(file_path, target_sr=22050):
-    """Loads, resamples, trims silence, and normalizes audio."""
+    """Loads, resamples, trims silence, and normalizes audio.
+
+    Returns (y_normalized, sr). If the effective audio after trimming is extremely
+    short (near-silence), y_normalized will be an empty array.
+    """
     y, sr = librosa.load(file_path, sr=target_sr, mono=True)
     y_trimmed, _ = librosa.effects.trim(y, top_db=20)
+
+    # If almost no audio remains after trimming, treat as silence / invalid input.
+    if y_trimmed.size == 0:
+        return np.array([]), sr
+
     max_val = np.max(np.abs(y_trimmed))
     if max_val > 0:
         y_normalized = y_trimmed / max_val
@@ -25,6 +34,9 @@ def load_audio_file(file_path, target_sr=22050):
 
 def convert_to_mel_spectrogram(y, sr, n_mels=128, hop_length=512, fmax=8000, max_pad_len=174):
     """Converts audio array into a padded Log-Mel Spectrogram."""
+    if y is None or y.size == 0:
+        # Return an all-zero spectrogram if input is effectively silence
+        return np.zeros((n_mels, max_pad_len))
     S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, hop_length=hop_length, fmax=fmax)
     S_dB = librosa.power_to_db(S, ref=np.max)
     
@@ -37,12 +49,17 @@ def convert_to_mel_spectrogram(y, sr, n_mels=128, hop_length=512, fmax=8000, max
     return S_dB
 
 def make_prediction(model, mel_spec):
+    """Run a forward pass and return (label, confidence, input_data).
+
+    If the model is highly uncertain (low softmax probability), callers can
+    use the confidence value to flag an unreliable prediction.
+    """
     # Reshape for model input
     input_data = mel_spec.reshape(1, mel_spec.shape[0], mel_spec.shape[1], 1)
     preds = model.predict(input_data, verbose=0)
     class_idx = np.argmax(preds[0])
-    confidence = preds[0][class_idx]
-    
+    confidence = float(preds[0][class_idx])
+
     return CLASSES[class_idx], confidence, input_data
 
 def get_last_conv_layer_name(model):

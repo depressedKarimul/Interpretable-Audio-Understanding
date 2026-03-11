@@ -21,7 +21,10 @@ st.title("Explainable Environmental Sound Classification")
 # Load model
 @st.cache_resource
 def load_trained_model():
-    model_path = os.path.join("model", "cnn_model.h5")
+    # Resolve model path relative to this file so it works
+    # regardless of where Streamlit is launched from.
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base_dir, "model", "cnn_model.h5")
     if os.path.exists(model_path):
         return tf.keras.models.load_model(model_path)
     else:
@@ -31,7 +34,7 @@ def load_trained_model():
 model = load_trained_model()
 
 if model is None:
-    st.error(f"Model not found at 'model/cnn_model.h5'. Please place your trained model there.")
+    st.error("Model not found. Please place the trained model at 'project/model/cnn_model.h5' relative to the repository root.")
 
 st.header("Upload Audio")
 uploaded_file = st.file_uploader("Upload an audio file (.wav)", type=["wav"])
@@ -47,10 +50,17 @@ if uploaded_file is not None and model is not None:
     with st.spinner("Processing audio..."):
         # Process audio
         y_norm, sr = load_audio_file(temp_path)
-        mel_spec = convert_to_mel_spectrogram(y_norm, sr)
-        
-        # Prediction
-        pred_label, confidence, input_data = make_prediction(model, mel_spec)
+        if y_norm is None or len(y_norm) == 0:
+            st.warning("The uploaded file appears to contain almost no audible content after trimming silence. Please upload a clearer sound clip.")
+            mel_spec = None
+            pred_label = None
+            confidence = None
+            input_data = None
+        else:
+            mel_spec = convert_to_mel_spectrogram(y_norm, sr)
+            
+            # Prediction
+            pred_label, confidence, input_data = make_prediction(model, mel_spec)
         
     with st.spinner("Generating Explanations (Grad-CAM & SHAP)..."):
         # Explanations
@@ -62,8 +72,13 @@ if uploaded_file is not None and model is not None:
         
         # Section: Prediction Result
         st.header("Prediction Result")
-        st.write(f"**Prediction:** {pred_label.replace('_', ' ').capitalize()}")
-        st.write(f"**Confidence:** {confidence * 100:.1f}%")
+        if pred_label is None:
+            st.write("No reliable prediction could be made for this audio.")
+        else:
+            st.write(f"**Prediction:** {pred_label.replace('_', ' ').capitalize()}")
+            st.write(f"**Confidence:** {confidence * 100:.1f}%")
+            if confidence < 0.6:
+                st.warning("The model is not very confident in this prediction (confidence below 60%). The sound may be ambiguous or out-of-distribution.")
         
         # Section: Model Explanation
         st.header("Model Explanation")
