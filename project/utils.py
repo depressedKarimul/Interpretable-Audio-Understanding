@@ -18,18 +18,25 @@ HOP_LENGTH = 512
 TARGET_LEN = int(SR * DURATION)
 SPEC_FRAMES = 1 + (TARGET_LEN // HOP_LENGTH)  # 173 with these defaults
 
-def load_audio_file(file_path, target_sr=22050):
+def load_audio_file(file_path, target_sr=SR, duration_s=DURATION, top_db=20):
     """Loads, resamples, trims silence, and normalizes audio.
 
     Returns (y_normalized, sr). If the effective audio after trimming is extremely
     short (near-silence), y_normalized will be an empty array.
     """
     y, sr = librosa.load(file_path, sr=target_sr, mono=True)
-    y_trimmed, _ = librosa.effects.trim(y, top_db=20)
+    y_trimmed, _ = librosa.effects.trim(y, top_db=int(top_db))
 
     # If almost no audio remains after trimming, treat as silence / invalid input.
     if y_trimmed.size == 0:
         return np.array([]), sr
+
+    # Enforce a fixed duration (pad/trim) for stable downstream features
+    target_len = int(float(duration_s) * sr)
+    if y_trimmed.size < target_len:
+        y_trimmed = np.pad(y_trimmed, (0, target_len - y_trimmed.size), mode="constant")
+    elif y_trimmed.size > target_len:
+        y_trimmed = y_trimmed[:target_len]
 
     max_val = np.max(np.abs(y_trimmed))
     if max_val > 0:
@@ -38,14 +45,35 @@ def load_audio_file(file_path, target_sr=22050):
         y_normalized = y_trimmed
     return y_normalized, sr
 
-def convert_to_mel_spectrogram(y, sr, n_mels=128, hop_length=HOP_LENGTH, fmax=8000, max_pad_len=None):
+def convert_to_mel_spectrogram(
+    y,
+    sr,
+    n_mels=128,
+    hop_length=HOP_LENGTH,
+    n_fft=2048,
+    fmax=8000,
+    max_pad_len=None,
+):
     """Converts audio array into a fixed-width Log-Mel Spectrogram."""
     if max_pad_len is None:
         max_pad_len = SPEC_FRAMES
     if y is None or y.size == 0:
         # Return an all-zero spectrogram if input is effectively silence
         return np.zeros((n_mels, max_pad_len))
-    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, hop_length=hop_length, fmax=fmax)
+
+    # Safety pad to avoid n_fft warnings on extremely short inputs
+    if y.size < int(n_fft):
+        y = np.pad(y, (0, int(n_fft) - y.size), mode="constant")
+
+    S = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_mels=int(n_mels),
+        hop_length=int(hop_length),
+        n_fft=int(n_fft),
+        fmax=float(fmax),
+        power=2.0,
+    )
     S_dB = librosa.power_to_db(S, ref=np.max)
 
     # Fix time axis to a consistent width.
@@ -88,6 +116,9 @@ def generate_gradcam_heatmap(model, img_array, last_conv_layer_name=None):
 
     with tf.GradientTape() as tape:
         last_conv_layer_output, preds = grad_model(img_array)
+        # Handle case where model.output is a list
+        if isinstance(preds, list):
+            preds = preds[0]
         class_idx = tf.argmax(preds[0])
         class_channel = preds[:, class_idx]
 
