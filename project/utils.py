@@ -12,6 +12,12 @@ import matplotlib.pyplot as plt
 CLASSES = ['air_conditioner', 'car_horn', 'children_playing', 'dog_bark', 'drilling',
            'engine_idling', 'gun_shot', 'jackhammer', 'siren', 'street_music']
 
+SR = 22050
+DURATION = 4.0
+HOP_LENGTH = 512
+TARGET_LEN = int(SR * DURATION)
+SPEC_FRAMES = 1 + (TARGET_LEN // HOP_LENGTH)  # 173 with these defaults
+
 def load_audio_file(file_path, target_sr=22050):
     """Loads, resamples, trims silence, and normalizes audio.
 
@@ -32,21 +38,19 @@ def load_audio_file(file_path, target_sr=22050):
         y_normalized = y_trimmed
     return y_normalized, sr
 
-def convert_to_mel_spectrogram(y, sr, n_mels=128, hop_length=512, fmax=8000, max_pad_len=174):
-    """Converts audio array into a padded Log-Mel Spectrogram."""
+def convert_to_mel_spectrogram(y, sr, n_mels=128, hop_length=HOP_LENGTH, fmax=8000, max_pad_len=None):
+    """Converts audio array into a fixed-width Log-Mel Spectrogram."""
+    if max_pad_len is None:
+        max_pad_len = SPEC_FRAMES
     if y is None or y.size == 0:
         # Return an all-zero spectrogram if input is effectively silence
         return np.zeros((n_mels, max_pad_len))
     S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, hop_length=hop_length, fmax=fmax)
     S_dB = librosa.power_to_db(S, ref=np.max)
-    
-    if S_dB.shape[1] > max_pad_len:
-        S_dB = S_dB[:, :max_pad_len]
-    else:
-        pad_width = max_pad_len - S_dB.shape[1]
-        S_dB = np.pad(S_dB, pad_width=((0, 0), (0, pad_width)), mode='constant')
-        
-    return S_dB
+
+    # Fix time axis to a consistent width.
+    S_dB = librosa.util.fix_length(S_dB, size=int(max_pad_len), axis=1)
+    return S_dB.astype(np.float32)
 
 def make_prediction(model, mel_spec):
     """Run a forward pass and return (label, confidence, input_data).
@@ -96,34 +100,42 @@ def generate_gradcam_heatmap(model, img_array, last_conv_layer_name=None):
     
     return heatmap.numpy()
 
-def generate_shap_explanation(model, img_array, background_size=10):
+def generate_shap_explanation(model, img_array, max_evals=200):
+    """Model-agnostic SHAP that won't break TF gradients."""
     try:
-        # Generate a small background of random noise instead of all zeros for better SHAP gradients
-        # Use values close to actual mel spectrogram ranges (-80 to 0)
-        background = np.random.uniform(low=-80, high=0, size=(background_size, 128, 174, 1))
-        
-        # We use GradientExplainer or DeepExplainer. Give preference to GradientExplainer for safety in TF2+
-        # But instructions said DeepExplainer. For a TF2 model, DeepExplainer might complain if run eagerly.
-        explainer = shap.DeepExplainer(model, background)
-        shap_values = explainer.shap_values(img_array)
-        
-        predicted_class_idx = np.argmax(model.predict(img_array, verbose=0))
-        
-        if isinstance(shap_values, list):
-            shap_spec = shap_values[predicted_class_idx][0, :, :, 0]
-        else:
-            if len(shap_values.shape) == 5: # (1, 128, 174, 1, 10)
-                shap_spec = shap_values[0, ..., predicted_class_idx][:, :, 0]
-            else:
-                shap_spec = shap_values[0, ..., predicted_class_idx]
-                if len(shap_spec.shape) == 3:
-                    shap_spec = shap_spec[:, :, 0]
-                    
-        return shap_spec
+        img_array = np.array(img_array, dtype=np.float32)
+        if img_array.ndim != 4:
+            raise ValueError(f"Expected img_array with shape (1,H,W,1); got shape {img_array.shape}")
+
+        H, W = int(img_array.shape[1]), int(img_array.shape[2])
+        pred = model.predict(img_array, verbose=0)[0]
+        predicted_class_idx = int(np.argmax(pred))
+
+        def _predict_fn(x):
+            x = np.array(x, dtype=np.float32)
+            if x.ndim == 3:
+                x = x[..., np.newaxis]
+            return model.predict(x, verbose=0)
+
+        masker = shap.maskers.Image("blur(8,8)", (H, W, 1))
+        explainer = shap.Explainer(_predict_fn, masker)
+        sv = explainer(img_array, max_evals=int(max_evals), batch_size=20)
+
+        vals = getattr(sv, "values", None)
+        if vals is None:
+            return np.zeros((H, W), dtype=np.float32)
+
+        vals = np.array(vals)
+        if vals.ndim == 5 and vals.shape[-1] > predicted_class_idx:
+            return vals[0, :, :, 0, predicted_class_idx].astype(np.float32)
+        if vals.ndim == 4:
+            return vals[0, :, :, 0].astype(np.float32)
+        return np.zeros((H, W), dtype=np.float32)
     except Exception as e:
         print(f"SHAP explanation failed: {e}")
-        # Return fallback dummy shap values
-        return np.zeros((128, 174))
+        h = int(img_array.shape[1]) if hasattr(img_array, "shape") and len(img_array.shape) >= 3 else 128
+        w = int(img_array.shape[2]) if hasattr(img_array, "shape") and len(img_array.shape) >= 3 else SPEC_FRAMES
+        return np.zeros((h, w), dtype=np.float32)
 
 def produce_human_readable_explanation(pred_label, heatmap):
     # Calculate properties of the heatmap
@@ -133,7 +145,8 @@ def produce_human_readable_explanation(pred_label, heatmap):
     highest_time_zone = np.argmax(time_mean) 
     highest_freq_zone = np.argmax(mel_mean)
     
-    time_sec = (highest_time_zone / 174) * 4.0 # approximate max length
+    width = int(heatmap.shape[1]) if hasattr(heatmap, "shape") else 1
+    time_sec = (highest_time_zone / max(1, width)) * DURATION # approximate max length
     
     if highest_freq_zone > 80:
         freq_desc = "high-frequency band"
