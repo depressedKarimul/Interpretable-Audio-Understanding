@@ -21,6 +21,8 @@ from utils import (  # noqa: E402
     generate_gradcam_heatmap,
     generate_shap_explanation,
     produce_human_readable_explanation,
+    generate_graph_explanation,
+    generate_final_conclusion,
 )
 
 st.set_page_config(page_title="Explainable Environmental Sound Classification", layout="wide")
@@ -175,17 +177,7 @@ with page[0]:
                     st.warning("This clip becomes mostly silence after trimming. Try a louder / clearer sample.")
                     st.stop()
 
-            # Waveform
-            wf_container = st.container(border=True)
-            with wf_container:
-                st.markdown("### Waveform")
-                fig_w, ax_w = plt.subplots(figsize=(10, 3))
-                librosa.display.waveshow(y_norm, sr=sr_eff, ax=ax_w)
-                ax_w.set_xlabel("Time (s)")
-                ax_w.grid(True, alpha=0.25)
-                st.pyplot(fig_w)
-
-            # Spectrogram
+            # Compute mel_spec and predictions earlier so the AI can explain the early graphs
             mel_spec = convert_to_mel_spectrogram(
                 y_norm,
                 sr_eff,
@@ -197,6 +189,29 @@ with page[0]:
             )
             input_data = mel_spec.reshape(1, mel_spec.shape[0], mel_spec.shape[1], 1).astype(np.float32)
 
+            pred_label = "Unknown"
+            probs = None
+            confidence = 0.0
+            if model is not None:
+                pred_label, confidence, _ = make_prediction(model, mel_spec)
+                probs = model.predict(input_data, verbose=0)[0]
+
+            # Waveform
+            wf_container = st.container(border=True)
+            with wf_container:
+                st.markdown("### Waveform")
+                fig_w, ax_w = plt.subplots(figsize=(10, 3))
+                librosa.display.waveshow(y_norm, sr=sr_eff, ax=ax_w)
+                ax_w.set_xlabel("Time (s)")
+                ax_w.grid(True, alpha=0.25)
+                st.pyplot(fig_w)
+                
+                if pred_label != "Unknown":
+                    with st.spinner("AI is analyzing the waveform..."):
+                        exp_w = generate_graph_explanation("Waveform (Amplitude vs Time)", pred_label, "This graph displays the raw audio amplitude envelope over time.")
+                        if exp_w: st.info(f"**AI Analysis:** {exp_w}")
+
+            # Spectrogram
             spec_container = st.container(border=True)
             with spec_container:
                 st.markdown("### Mel spectrogram (model input)")
@@ -213,6 +228,11 @@ with page[0]:
                 fig_s.colorbar(im, ax=ax_s, format="%+2.0f dB")
                 ax_s.set_title("Log-Mel spectrogram")
                 st.pyplot(fig_s)
+                
+                if pred_label != "Unknown":
+                    with st.spinner("AI is analyzing the spectrogram..."):
+                        exp_s = generate_graph_explanation("Mel Spectrogram (Frequency vs Time)", pred_label, "This graph displays the frequency energy patterns (low to high bands) of the sound.")
+                        if exp_s: st.info(f"**AI Analysis:** {exp_s}")
 
             # Prediction section
             pred_container = st.container(border=True)
@@ -220,11 +240,7 @@ with page[0]:
                 st.markdown("### Prediction")
                 if model is None:
                     st.info("Model is not available, so predictions are disabled. Add `project/model/cnn_model.h5`.")
-                    probs = None
                 else:
-                    pred_label, confidence, _ = make_prediction(model, mel_spec)
-                    probs = model.predict(input_data, verbose=0)[0]
-
                     c1, c2 = st.columns(2)
                     with c1:
                         st.metric("Predicted class", pred_label.replace("_", " ").title())
@@ -243,6 +259,14 @@ with page[0]:
                     ax_p.set_title("Class probabilities")
                     ax_p.grid(True, axis="y", alpha=0.25)
                     st.pyplot(fig_p)
+                    
+                    with st.spinner("AI is analyzing the class probabilities..."):
+                        top_indices = np.argsort(probs)[-3:][::-1]
+                        top_classes = [labels[i].replace('_', ' ') for i in top_indices]
+                        top_probs = [probs[i] for i in top_indices]
+                        probs_str = ", ".join([f"{cls} ({p*100:.1f}%)" for cls, p in zip(top_classes, top_probs)])
+                        exp_p = generate_graph_explanation("Class Probabilities Bar Chart", pred_label, f"The top predictions are: {probs_str}. Explain why the model is confident or confused between these.")
+                        if exp_p: st.info(f"**AI Analysis:** {exp_p}")
 
             # Explainability section
             exp_container = st.container(border=True)
@@ -288,6 +312,28 @@ with page[0]:
                     ax_sh.set_title("SHAP feature importance (masked, model-agnostic)")
                     ax_sh.axis("off")
                     st.pyplot(fig_sh)
+                    
+                    if pred_label != "Unknown" and pred_label is not None:
+                        with st.spinner("AI is analyzing the SHAP visualization..."):
+                            exp_sh = generate_graph_explanation("SHAP Feature Importance Map", pred_label, "This graph highlights which subtle parts of the audio contributed most significantly to the final decision.")
+                            if exp_sh: st.info(f"**AI Analysis:** {exp_sh}")
+
+            # Final Conclusion section
+            if pred_label != "Unknown" and model is not None:
+                final_container = st.container(border=True)
+                with final_container:
+                    st.markdown("### Final AI Conclusion")
+                    with st.spinner("AI is summarizing the final decision..."):
+                        top_indices = np.argsort(probs)[-3:][::-1]
+                        top_classes = [labels[i].replace('_', ' ') for i in top_indices]
+                        top_probs = [probs[i] for i in top_indices]
+                        probs_str = ", ".join([f"{cls} ({p*100:.1f}%)" for cls, p in zip(top_classes, top_probs)])
+                        
+                        final_conclusion = generate_final_conclusion(pred_label, confidence, probs_str)
+                        if final_conclusion:
+                            st.success(f"**Verdict:** {final_conclusion}")
+                        else:
+                            st.write("Could not generate a final AI conclusion at this time.")
 
         finally:
             try:

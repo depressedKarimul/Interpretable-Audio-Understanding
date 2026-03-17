@@ -5,3 +5,4 @@ tensorflow
 opencv-python-headless
 shap
 matplotlib
+groq
