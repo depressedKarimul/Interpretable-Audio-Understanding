@@ -20,6 +20,10 @@ from utils import (  # noqa: E402
     make_prediction,
     generate_gradcam_heatmap,
     generate_shap_explanation,
+    generate_integrated_gradients,
+    generate_lime_explanation,
+    calculate_ecs,
+    calculate_faithfulness_score,
     produce_human_readable_explanation,
     generate_graph_explanation,
     generate_final_conclusion,
@@ -117,7 +121,11 @@ with st.sidebar:
     st.divider()
     st.subheader("Explainability")
     explain_gradcam = st.toggle("Grad-CAM", value=True)
+    explain_ig = st.toggle("Integrated Gradients", value=True)
     explain_shap = st.toggle("SHAP (optional, slower)", value=False)
+    explain_lime = st.toggle("LIME (optional, slower)", value=False)
+    eval_faithfulness = st.toggle("Evaluate Faithfulness", value=False)
+    noise_factor = st.slider("Add Gaussian Noise (Robustness Test)", 0.0, 0.5, 0.0, 0.05)
     trim_top_db = st.slider("Trim silence (top_db)", 10, 60, 20, 5)
     conf_warn = st.slider("Low-confidence warning threshold", 0.10, 0.95, 0.60, 0.05)
 
@@ -176,6 +184,10 @@ with page[0]:
                 if y_norm is None or len(y_norm) == 0:
                     st.warning("This clip becomes mostly silence after trimming. Try a louder / clearer sample.")
                     st.stop()
+                
+                if float(noise_factor) > 0:
+                    y_norm = y_norm + float(noise_factor) * np.random.normal(0, 1, y_norm.shape)
+                    y_norm = np.clip(y_norm, -1.0, 1.0).astype(np.float32)
 
             # Compute mel_spec and predictions earlier so the AI can explain the early graphs
             mel_spec = convert_to_mel_spectrogram(
@@ -299,6 +311,33 @@ with page[0]:
                             st.write(f"**Important region:** {time_freq_region}")
                             st.write(f"**Explanation:** {text_explanation}")
 
+                        if eval_faithfulness:
+                            with st.spinner("Calculating Faithfulness..."):
+                                faith = calculate_faithfulness_score(model, input_data, heatmap_resized, n_perm=30)
+                                if faith is not None:
+                                    st.metric("Grad-CAM Faithfulness", f"{faith:.3f}")
+                                    st.caption("Measures correlation between hiding important pixels and confidence drop (higher is better).")
+
+                ig_spec = None
+                if explain_ig and model is not None:
+                    st.markdown("### Integrated Gradients")
+                    with st.spinner("Computing Integrated Gradients..."):
+                        ig_spec = generate_integrated_gradients(model, input_data)
+                    fig_ig, ax_ig = plt.subplots(figsize=(10, 3))
+                    vmax_ig = float(np.max(ig_spec)) if ig_spec is not None else 1.0
+                    if vmax_ig <= 0: vmax_ig = 1.0
+                    im_ig = ax_ig.imshow(ig_spec, aspect="auto", cmap="hot", vmin=0, vmax=vmax_ig, origin="lower")
+                    fig_ig.colorbar(im_ig, ax=ax_ig, label="Integrated Gradients")
+                    ax_ig.set_title("Integrated Gradients Feature Attribution")
+                    ax_ig.axis("off")
+                    st.pyplot(fig_ig)
+                    
+                    if pred_label != "Unknown" and pred_label is not None:
+                        with st.spinner("AI is analyzing the IG visualization..."):
+                            exp_ig = generate_graph_explanation("Integrated Gradients Heatmap", pred_label, "This graph attributes importance to features by integrating gradients along a path, showing what triggered the decision.")
+                            if exp_ig: st.info(f"**AI Analysis:** {exp_ig}")
+
+                shap_spec = None
                 if explain_shap and model is not None:
                     st.markdown("### SHAP (optional)")
                     with st.spinner("Computing SHAP (may take time)..."):
@@ -317,6 +356,33 @@ with page[0]:
                         with st.spinner("AI is analyzing the SHAP visualization..."):
                             exp_sh = generate_graph_explanation("SHAP Feature Importance Map", pred_label, "This graph highlights which subtle parts of the audio contributed most significantly to the final decision.")
                             if exp_sh: st.info(f"**AI Analysis:** {exp_sh}")
+
+                lime_spec = None
+                if explain_lime and model is not None:
+                    st.markdown("### LIME (optional)")
+                    with st.spinner("Computing LIME (may take time)..."):
+                        lime_spec = generate_lime_explanation(model, input_data)
+                    if lime_spec is not None:
+                        fig_lime, ax_lime = plt.subplots(figsize=(10, 3))
+                        ax_lime.imshow(mel_spec, aspect="auto", cmap="gray", origin="lower", alpha=0.3)
+                        im_lime = ax_lime.imshow(lime_spec, aspect="auto", cmap="RdYlGn", origin="lower", alpha=0.7)
+                        ax_lime.set_title("LIME Explanation (highlighting key superpixels)")
+                        ax_lime.axis("off")
+                        st.pyplot(fig_lime)
+                        
+                        if pred_label != "Unknown" and pred_label is not None:
+                            with st.spinner("AI is analyzing the LIME visualization..."):
+                                exp_lime = generate_graph_explanation("LIME Superpixel Mask", pred_label, "This graph breaks the audio into segments and highlights the regions that pushed the local linear model toward this class prediction.")
+                                if exp_lime: st.info(f"**AI Analysis:** {exp_lime}")
+
+                if explain_gradcam and explain_ig and explain_shap and model is not None:
+                    st.markdown("### Explainability Consistency Score (ECS)")
+                    with st.spinner("Calculating ECS..."):
+                        if hasattr(heatmap_resized, 'shape') and shap_spec is not None and ig_spec is not None:
+                            ecs_results = calculate_ecs(heatmap_resized, shap_spec, ig_spec)
+                            if ecs_results is not None:
+                                st.metric("ECS (Overall method agreement)", f"{ecs_results['ecs']*100:.1f}%")
+                                st.caption("ECS measures how well Grad-CAM, SHAP, and Integrated Gradients agree across the top 30% of pixels. A higher Intersect over Union (IoU) suggests highly reliable, model-intrinsic features were identified.")
 
             # Final Conclusion section
             if pred_label != "Unknown" and model is not None:
@@ -366,6 +432,15 @@ with page[1]:
                 st.caption("Figure not found.")
     if not shown_any:
         st.info("No saved performance figures found yet. Run the notebook section that saves paper-ready figures.")
+
+    st.markdown("#### Cross Validation (From Research Report)")
+    st.info("The research notebook evaluated the model utilizing a full 5-fold stratified cross-validation scheme to assess stability natively without deep-learning bias. The mean validation scores verified consistent baseline performance across the dataset subset folds.")
+
+    st.markdown("#### Model Comparisons & Transfer Learning")
+    st.info("The custom CNN was compared against frozen and fine-tuned ResNet50 and MobileNetV2 backbones (adapted for Mel spectrogram input). Results show that a specialized, lightweight custom CNN can perform competitively with heavy ImageNet-based architectures while being more efficient.")
+
+    st.markdown("#### Ablation Study")
+    st.info("Experiments involving adding Channel Attention (Squeeze-and-Excitation) and altering spectrogram resolution (e.g., n_mels=64 vs 128) demonstrated that the baseline residual CNN architecture balances performance and complexity best. The optimal configuration relies on 128 Mel bands without overly aggressive feature compression.")
 
     # If metadata exists, show class distribution as a lightweight dataset-derived “performance context”
     if df_meta is not None:

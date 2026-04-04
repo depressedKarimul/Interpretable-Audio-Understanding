@@ -387,6 +387,82 @@ def generate_shap_explanation(model, img_array, max_evals=200):
         w = int(img_array.shape[2]) if hasattr(img_array, "shape") and len(img_array.shape) >= 3 else SPEC_FRAMES
         return np.zeros((h, w), dtype=np.float32)
 
+def generate_integrated_gradients(model, img_array, baseline=None, steps=50):
+    """Computes Integrated Gradients for a given spatial input."""
+    try:
+        if baseline is None:
+            baseline = np.zeros_like(img_array).astype(np.float32)
+        img_array = img_array.astype(np.float32)
+        baseline = baseline.astype(np.float32)
+        target_idx = np.argmax(model.predict(img_array, verbose=0)[0])
+        alphas = np.linspace(0, 1, steps + 1)
+        grads = []
+        for a in alphas:
+            interp = baseline + a * (img_array - baseline)
+            interp = tf.convert_to_tensor(interp)
+            with tf.GradientTape() as tape:
+                tape.watch(interp)
+                preds = model(interp)
+                target = preds[0, target_idx]
+            g = tape.gradient(target, interp)
+            grads.append(g.numpy())
+        grads = np.stack(grads, axis=0)
+        avg_grads = (grads[:-1] + grads[1:]) / 2
+        integrated = (img_array - baseline) * np.mean(avg_grads, axis=0)
+        
+        ig_attr = np.squeeze(integrated)
+        if ig_attr.ndim == 3:
+            ig_attr = ig_attr[:, :, 0]
+        
+        ig_attr = np.maximum(ig_attr, 0)
+        return ig_attr
+    except Exception as e:
+        print(f"Integrated Gradients failed: {e}")
+        h = int(img_array.shape[1]) if hasattr(img_array, "shape") and len(img_array.shape) >= 3 else 128
+        w = int(img_array.shape[2]) if hasattr(img_array, "shape") and len(img_array.shape) >= 3 else SPEC_FRAMES
+        return np.zeros((h, w), dtype=np.float32)
+
+from scipy.ndimage import gaussian_filter
+
+def calculate_ecs(gradcam, shap_map, ig_map, k_percent=30):
+    """Calculates Explainability Consistency Score given normalized heatmaps."""
+    try:
+        def top_k_mask(saliency, k):
+            sal_flat = np.abs(saliency).flatten()
+            if len(sal_flat) == 0: return np.zeros_like(saliency)
+            thresh = np.percentile(sal_flat, 100 - k)
+            return (np.abs(saliency) >= thresh).astype(np.float32)
+
+        def iou(m1, m2):
+            m1, m2 = m1.flatten(), m2.flatten()
+            inter = np.sum(m1 * m2)
+            union = np.sum(m1) + np.sum(m2) - inter
+            return float(inter / union) if union > 0 else 0.0
+
+        # Apply Gaussian smoothing and calculate top-k masks
+        gradcam_smooth = gaussian_filter(gradcam, sigma=2)
+        shap_smooth = gaussian_filter(shap_map, sigma=2)
+        ig_smooth = gaussian_filter(ig_map, sigma=2)
+
+        gradcam_bin = top_k_mask(gradcam_smooth, k_percent)
+        shap_bin = top_k_mask(shap_smooth, k_percent)
+        ig_bin = top_k_mask(ig_smooth, k_percent)
+
+        iou_gc_shap = iou(gradcam_bin, shap_bin)
+        iou_gc_ig = iou(gradcam_bin, ig_bin)
+        iou_shap_ig = iou(shap_bin, ig_bin)
+        ecs = (iou_gc_shap + iou_gc_ig + iou_shap_ig) / 3
+        
+        return {
+            "ecs": ecs,
+            "iou_gc_shap": iou_gc_shap,
+            "iou_gc_ig": iou_gc_ig,
+            "iou_shap_ig": iou_shap_ig
+        }
+    except Exception as e:
+        print(f"ECS calculation failed: {e}")
+        return None
+
 def produce_human_readable_explanation(pred_label, heatmap):
     # Calculate properties of the heatmap
     time_mean = np.mean(heatmap, axis=0)
@@ -492,4 +568,62 @@ def generate_final_conclusion(pred_label, confidence, probs_str):
         return chat_completion.choices[0].message.content.strip()
     except Exception as e:
         print(f"Groq API error for final conclusion: {e}")
+        return None
+
+def generate_lime_explanation(model, img_array, num_samples=50):
+    try:
+        from lime import lime_image
+        from skimage.segmentation import slic
+        
+        def predict_fn_lime(images):
+            # LIME provides RGB images of shape (N, H, W, 3).
+            # Convert back to (N, H, W, 1) expected by the model.
+            x = np.array(images)[:, :, :, 0:1]
+            return model.predict(x, batch_size=64, verbose=0)
+            
+        sample_for_lime = np.repeat(img_array[0], 3, axis=-1)
+        explainer_lime = lime_image.LimeImageExplainer()
+        explanation_lime = explainer_lime.explain_instance(
+            sample_for_lime.astype(np.double),
+            predict_fn_lime,
+            top_labels=1,
+            hide_color=0,
+            num_samples=num_samples,
+            segmentation_fn=lambda x: slic(x[:, :, 0], n_segments=30, compactness=10, channel_axis=None),
+        )
+        lime_img, lime_mask = explanation_lime.get_image_and_mask(
+            explanation_lime.top_labels[0], positive_only=True, num_features=10, hide_rest=False
+        )
+        return lime_mask.astype(np.float32)
+    except Exception as e:
+        print(f"LIME explanation failed (ensure lime/skimage are installed): {e}")
+        return None
+
+def calculate_faithfulness_score(model, img_array, saliency_map, n_perm=30, top_frac=0.2):
+    """Calculates Faithfulness score: the correlation between saliency importance and prediction drop."""
+    try:
+        h, w = saliency_map.shape
+        flat_sal = saliency_map.flatten()
+        pred_class = np.argmax(model.predict(img_array, verbose=0)[0])
+        base_prob = float(model.predict(img_array, verbose=0)[0, pred_class])
+        
+        drops, sals = [], []
+        for _ in range(n_perm):
+            idx = np.random.choice(len(flat_sal), size=int(top_frac * len(flat_sal)), replace=False)
+            mask = np.ones(len(flat_sal))
+            mask[idx] = 0
+            x_masked = (img_array[0].flatten() * mask).reshape(1, h, w, 1).astype(np.float32)
+            p_masked = float(model.predict(x_masked, verbose=0)[0, pred_class])
+            
+            drops.append(base_prob - p_masked)
+            sals.append(float(np.mean(flat_sal[idx])))
+            
+        if np.std(sals) > 0:
+            correlation = np.corrcoef(drops, sals)[0, 1]
+        else:
+            correlation = 0.0
+            
+        return correlation
+    except Exception as e:
+        print(f"Faithfulness calculation failed: {e}")
         return None
